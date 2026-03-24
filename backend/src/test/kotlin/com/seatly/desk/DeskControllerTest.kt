@@ -238,6 +238,204 @@ class DeskControllerTest {
   }
 
   @Test
+  fun `should create recurring weekly bookings successfully`() {
+    val desk: DeskResponse =
+      createDesk(
+        client = client,
+        authToken = authToken,
+        name = "Recurring Desk 1",
+        location = "Recurring Floor 1",
+      )
+    val deskId = desk.id!!
+
+    val recurringStart =
+      LocalDateTime
+        .now()
+        .plusDays(1)
+        .truncatedTo(ChronoUnit.HOURS)
+        .withHour(10)
+        .withMinute(0)
+    val recurringEnd = recurringStart.plusHours(1)
+    val createBookingRequest =
+      CreateBookingRequest(
+        startAt = recurringStart,
+        endAt = recurringEnd,
+        recurrenceType = BookingRecurrenceType.WEEKLY,
+        occurrences = 4,
+      )
+
+    val bookingResponse =
+      client.toBlocking().exchange(
+        HttpRequest
+          .POST("desks/$deskId/bookings", createBookingRequest)
+          .bearerAuth(authToken),
+        BookingResponse::class.java,
+      )
+
+    assertEquals(HttpStatus.CREATED, bookingResponse.status)
+    val booking = bookingResponse.body()
+    assertNotNull(booking)
+    assertEquals(BookingRecurrenceType.WEEKLY, booking!!.recurrenceType)
+    assertEquals(4, booking.createdCount)
+    assertEquals(4, booking.bookings.size)
+
+    // Verify the API summary and the DB both reflect the generated weekly series.
+    val savedBookings =
+      bookingRepository
+        .findAll()
+        .toList()
+        .filter { it.deskId == deskId }
+        .sortedBy { it.startAt }
+
+    assertEquals(4, savedBookings.size)
+
+    val expectedStarts =
+      (0 until 4).map { weekOffset ->
+        recurringStart.truncatedTo(ChronoUnit.MINUTES).plusWeeks(weekOffset.toLong())
+      }
+    val expectedEnds =
+      (0 until 4).map { weekOffset ->
+        recurringEnd.truncatedTo(ChronoUnit.MINUTES).plusWeeks(weekOffset.toLong())
+      }
+
+    assertEquals(expectedStarts, savedBookings.map { it.startAt })
+    assertEquals(expectedEnds, savedBookings.map { it.endAt })
+    assertEquals(expectedStarts, booking.bookings.map { it.startAt })
+    assertEquals(expectedEnds, booking.bookings.map { it.endAt })
+  }
+
+  @Test
+  fun `should reject recurring booking when one occurrence conflicts and save nothing from the series`() {
+    val desk: DeskResponse =
+      createDesk(
+        client = client,
+        authToken = authToken,
+        name = "Recurring Conflict Desk 1",
+        location = "Recurring Conflict Floor 1",
+      )
+    val deskId = desk.id!!
+
+    val recurringStart =
+      LocalDateTime
+        .now()
+        .plusDays(1)
+        .truncatedTo(ChronoUnit.HOURS)
+        .withHour(11)
+        .withMinute(0)
+    val recurringEnd = recurringStart.plusHours(1)
+
+    val existingBookingRequest =
+      CreateBookingRequest(
+        startAt = recurringStart.plusWeeks(2),
+        endAt = recurringEnd.plusWeeks(2),
+      )
+    val existingBookingResponse =
+      client.toBlocking().exchange(
+        HttpRequest
+          .POST("desks/$deskId/bookings", existingBookingRequest)
+          .bearerAuth(authToken),
+        BookingResponse::class.java,
+      )
+    assertEquals(HttpStatus.CREATED, existingBookingResponse.status)
+
+    val recurringBookingRequest =
+      CreateBookingRequest(
+        startAt = recurringStart,
+        endAt = recurringEnd,
+        recurrenceType = BookingRecurrenceType.WEEKLY,
+        occurrences = 4,
+      )
+
+    val exception =
+      assertThrows(HttpClientResponseException::class.java) {
+        client.toBlocking().exchange(
+          HttpRequest
+            .POST("desks/$deskId/bookings", recurringBookingRequest)
+            .bearerAuth(authToken),
+          BookingResponse::class.java,
+        )
+      }
+
+    assertEquals(HttpStatus.CONFLICT, exception.status)
+
+    // The pre-save conflict check should prevent any recurring rows from being inserted.
+    val savedBookings =
+      bookingRepository
+        .findAll()
+        .toList()
+        .filter { it.deskId == deskId }
+
+    assertEquals(1, savedBookings.size)
+    assertEquals(existingBookingRequest.startAt.truncatedTo(ChronoUnit.MINUTES), savedBookings[0].startAt)
+    assertEquals(existingBookingRequest.endAt.truncatedTo(ChronoUnit.MINUTES), savedBookings[0].endAt)
+  }
+
+  @Test
+  fun `should show recurring booking occurrences in availability`() {
+    val desk: DeskResponse =
+      createDesk(
+        client = client,
+        authToken = authToken,
+        name = "Recurring Availability Desk 1",
+        location = "Recurring Availability Floor 1",
+      )
+    val deskId = desk.id!!
+
+    val recurringStart =
+      LocalDateTime
+        .now()
+        .plusDays(1)
+        .truncatedTo(ChronoUnit.HOURS)
+        .withHour(9)
+        .withMinute(0)
+    val recurringEnd = recurringStart.plusMinutes(30)
+    val createBookingRequest =
+      CreateBookingRequest(
+        startAt = recurringStart,
+        endAt = recurringEnd,
+        recurrenceType = BookingRecurrenceType.WEEKLY,
+        occurrences = 3,
+      )
+
+    val bookingResponse =
+      client.toBlocking().exchange(
+        HttpRequest
+          .POST("desks/$deskId/bookings", createBookingRequest)
+          .bearerAuth(authToken),
+        BookingResponse::class.java,
+      )
+    assertEquals(HttpStatus.CREATED, bookingResponse.status)
+
+    val targetWeekStart = recurringStart.plusWeeks(1)
+    val targetWeekEnd = targetWeekStart.plusHours(2)
+    val path =
+      "/desks/$deskId/availability?startAt=$targetWeekStart&endAt=$targetWeekEnd"
+
+    val availabilityResponse =
+      client.toBlocking().exchange(
+        HttpRequest
+          .GET<Any>(path)
+          .bearerAuth(authToken),
+        Argument.listOf(AvailabilityResponse::class.java),
+      )
+
+    assertEquals(HttpStatus.OK, availabilityResponse.status)
+    val availability = availabilityResponse.body()
+    assertNotNull(availability)
+
+    // Recurring bookings reuse the normal availability path because each
+    // generated occurrence is stored as a regular booking row.
+    val bookedSlot =
+      availability!!.firstOrNull {
+        it.startAt == targetWeekStart.truncatedTo(ChronoUnit.MINUTES) &&
+          it.endAt == recurringEnd.plusWeeks(1).truncatedTo(ChronoUnit.MINUTES)
+      }
+
+    assertNotNull(bookedSlot)
+    assertEquals(AvailabilityStatus.BOOKED, bookedSlot!!.status)
+  }
+
+  @Test
   fun `Should list available desk bookings within time range`() {
     val desk: DeskResponse =
       createDesk(
