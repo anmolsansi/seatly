@@ -1,11 +1,13 @@
 package com.seatly.desk
 
+import io.micronaut.serde.annotation.Serdeable
 import jakarta.inject.Singleton
+import jakarta.transaction.Transactional
 import java.time.LocalDateTime
 import java.time.temporal.ChronoUnit
 
 @Singleton
-class DeskManager(
+open class DeskManager(
   private val deskRepository: DeskRepository,
   private val bookingRepository: BookingRepository,
 ) {
@@ -77,28 +79,128 @@ class DeskManager(
     return slots
   }
 
-  fun createBooking(command: CreateBookingCommand): BookingDto {
-    require(command.startAt.isBefore(command.endAt)) {
-      "startAt must be before endAt"
-    }
+  // Expand + validate + conflict-check the full series, then save atomically.
+  @Transactional
+  open fun createBooking(command: CreateBookingCommand): BookingCreationResultDto {
+    val generatedOccurrences = command.generateOccurrences()
+    validateGeneratedOccurrences(generatedOccurrences)
+    // Validate the whole series before saving so recurring requests are
+    // all-or-nothing instead of partially creating some weeks.
+    bookingRepository.validateNoConflictingOccurrences(
+      deskId = command.deskId,
+      occurrences = generatedOccurrences,
+    )
 
-    val normalizedStart = command.startAt.truncatedTo(ChronoUnit.MINUTES)
-    val normalizedEnd = command.endAt.truncatedTo(ChronoUnit.MINUTES)
+    val savedBookings =
+      generatedOccurrences.map { occurrence ->
+        bookingRepository.save(
+          Booking(
+            deskId = command.deskId,
+            userId = command.userId,
+            startAt = occurrence.startAt,
+            endAt = occurrence.endAt,
+          ),
+        )
+      }
 
-    if (bookingRepository.existsOverlappingBooking(command.deskId, normalizedStart, normalizedEnd)) {
-      throw IllegalStateException("Desk is already booked for the given time range")
-    }
+    val savedBookingDtos = savedBookings.map { BookingDto.from(it) }
 
-    val booking =
-      Booking(
-        deskId = command.deskId,
-        userId = command.userId,
-        startAt = normalizedStart,
-        endAt = normalizedEnd,
+    return BookingCreationResultDto(
+      primaryBooking = savedBookingDtos.first(),
+      createdCount = savedBookingDtos.size,
+      recurrenceType = command.recurrenceType,
+      bookings = savedBookingDtos,
+    )
+  }
+}
+
+private data class BookingOccurrence(
+  val startAt: LocalDateTime,
+  val endAt: LocalDateTime,
+)
+
+private fun CreateBookingCommand.generateOccurrences(): List<BookingOccurrence> {
+  validateRecurrenceRequest()
+
+  val normalizedStart = startAt.truncatedTo(ChronoUnit.MINUTES)
+  val normalizedEnd = endAt.truncatedTo(ChronoUnit.MINUTES)
+
+  return when (recurrenceType) {
+    null ->
+      listOf(
+        BookingOccurrence(
+          startAt = normalizedStart,
+          endAt = normalizedEnd,
+        ),
       )
+    // Weekly recurrence is expanded server-side so later steps can validate and
+    // persist each generated booking consistently.
+    BookingRecurrenceType.WEEKLY -> {
+      val totalOccurrences = occurrences ?: 1
 
-    val savedBooking = bookingRepository.save(booking)
-    return BookingDto.from(savedBooking)
+      (0 until totalOccurrences).map { occurrenceIndex ->
+        BookingOccurrence(
+          startAt = normalizedStart.plusWeeks(occurrenceIndex.toLong()),
+          endAt = normalizedEnd.plusWeeks(occurrenceIndex.toLong()),
+        )
+      }
+    }
+  }
+}
+
+private fun CreateBookingCommand.validateRecurrenceRequest() {
+  require(startAt.isBefore(endAt)) {
+    "startAt must be before endAt"
+  }
+
+  when (recurrenceType) {
+    null ->
+      require(occurrences == null) {
+        "occurrences can only be used with a recurrenceType"
+      }
+    // The enum already constrains supported recurrence values, so this branch
+    // only needs to enforce the rest of the recurring input contract.
+    BookingRecurrenceType.WEEKLY -> {
+      requireNotNull(occurrences) {
+        "occurrences is required for weekly recurring bookings"
+      }
+
+      require(occurrences >= 1) {
+        "occurrences must be at least 1"
+      }
+    }
+  }
+}
+
+private fun validateGeneratedOccurrences(occurrences: List<BookingOccurrence>) {
+  require(occurrences.isNotEmpty()) {
+    "Booking request must generate at least one occurrence"
+  }
+
+  // Re-check the expanded series so later steps can safely validate/save each
+  // generated booking without repeating this shape validation.
+  require(occurrences.all { it.startAt.isBefore(it.endAt) }) {
+    "Each booking occurrence must have startAt before endAt"
+  }
+}
+
+private fun BookingRepository.validateNoConflictingOccurrences(
+  deskId: Long,
+  occurrences: List<BookingOccurrence>,
+) {
+  // Check the whole generated series up front so a recurring request cannot
+  // partially succeed once multi-row persistence is enabled.
+  val hasConflict =
+    occurrences.any { occurrence ->
+      existsOverlappingBooking(
+        deskId = deskId,
+        startAt = occurrence.startAt,
+        endAt = occurrence.endAt,
+      )
+    }
+
+  if (hasConflict) {
+    throw BookingConflictException()
   }
 }
 
@@ -152,7 +254,19 @@ data class CreateBookingCommand(
   val userId: Long,
   val startAt: LocalDateTime,
   val endAt: LocalDateTime,
+  // Null = "existing one-off booking flow".
+  val recurrenceType: BookingRecurrenceType? = null,
+  // One request into multiple weekly bookings.
+  val occurrences: Int? = null,
 )
+
+@Serdeable
+enum class BookingRecurrenceType {
+  // Weekly recurrence only.
+  WEEKLY,
+}
+
+class BookingConflictException : RuntimeException("Desk is already booked for the given time range")
 
 data class BookingDto(
   val id: Long,
@@ -172,3 +286,12 @@ data class BookingDto(
       )
   }
 }
+
+data class BookingCreationResultDto(
+  // Keeps the existing one-booking fields available in the API response.
+  val primaryBooking: BookingDto,
+  val createdCount: Int,
+  val recurrenceType: BookingRecurrenceType?,
+  // Includes every saved occurrence so recurring creates are explicit.
+  val bookings: List<BookingDto>,
+)

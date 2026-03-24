@@ -15,6 +15,9 @@ export type CreateBookingInput = {
   deskId: number;
   startAt: string;
   endAt: string;
+  // Only weekly recurrence.
+  recurrenceType?: "WEEKLY";
+  occurrences?: number;
 };
 
 type ApiError = {
@@ -95,7 +98,7 @@ async function createBooking(
     throw new Error("Not authenticated");
   }
 
-  const {deskId, startAt, endAt} = input;
+  const {deskId, startAt, endAt, recurrenceType, occurrences} = input;
 
   const response = await fetch(`${API_BASE_URL}/desks/${deskId}/bookings`, {
     method: "POST",
@@ -103,7 +106,12 @@ async function createBooking(
       "Content-Type": "application/json",
       Authorization: `Bearer ${accessToken}`,
     },
-    body: JSON.stringify({startAt, endAt}),
+    // Recurrence fields are only sent when the user chooses weekly booking.
+    body: JSON.stringify({
+      startAt,
+      endAt,
+      ...(recurrenceType ? {recurrenceType, occurrences} : {}),
+    }),
   });
 
   if (!response.ok) {

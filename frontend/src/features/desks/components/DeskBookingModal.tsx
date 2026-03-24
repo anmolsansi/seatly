@@ -13,6 +13,9 @@ type DeskBookingModalProps = {
   onClose: () => void;
 };
 
+// "single" keeps existing behavior; "weekly" enables recurrence fields/payload.
+type BookingMode = "single" | "weekly";
+
 function toLocalDateTimeString(date: Date): string {
   const pad = (n: number) => n.toString().padStart(2, "0");
 
@@ -55,7 +58,11 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
                                                                   }) => {
   const queryClient = useQueryClient();
   const [selectedDate, setSelectedDate] = React.useState<Date>(() => new Date());
+  // Recurrence controls introduced for recurring bookings.
+  const [bookingMode, setBookingMode] = React.useState<BookingMode>("single");
+  const [occurrences, setOccurrences] = React.useState("4");
 
+  // Availability is always fetched for the selected business-hours window.
   const start = React.useMemo(
     () =>
       new Date(
@@ -109,11 +116,29 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
 
   const handleBookSlot = async (slot: AvailabilitySlot) => {
     setBookingError(null);
+
+    // Weekly mode must submit a positive integer occurrence count.
+    const trimmedOccurrences = occurrences.trim();
+    const parsedOccurrences = Number.parseInt(trimmedOccurrences, 10);
+    if (bookingMode === "weekly" && (!Number.isInteger(parsedOccurrences) || parsedOccurrences < 1)) {
+      setBookingError("Weekly recurring bookings require at least 1 occurrence.");
+      return;
+    }
+
     try {
       await bookingMutation.mutateAsync({
         deskId: desk.id,
         startAt: slot.startAt,
         endAt: slot.endAt,
+        // Keep single-booking requests unchanged; only attach recurrence when selected.
+        ...(bookingMode === "weekly"
+          ? {
+              // The modal keeps the current slot selection and only adds the
+              // extra weekly recurrence details when requested by the user.
+              recurrenceType: "WEEKLY" as const,
+              occurrences: parsedOccurrences,
+            }
+          : {}),
       });
 
       // Refresh availability after successful booking
@@ -141,7 +166,10 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
 
   React.useEffect(() => {
     if (isOpen) {
+      // Re-initialize modal state on each open so a previous choice doesn't leak.
       setSelectedDate(new Date());
+      setBookingMode("single");
+      setOccurrences("4");
       setBookingError(null);
     }
   }, [isOpen]);
@@ -176,6 +204,7 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
           Book desk: {desk.name}
         </h2>
 
+        {/* Recurrence controls are separate from date selection to keep single booking default simple. */}
         <div
           style={{
             display: "flex",
@@ -198,6 +227,47 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
           <span style={{marginLeft: "auto"}}>
             Showing availability 09:00 – 17:00
           </span>
+        </div>
+
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "0.75rem",
+            marginBottom: "0.75rem",
+            fontSize: "0.9rem",
+            flexWrap: "wrap",
+          }}
+        >
+          <label htmlFor="booking-mode" style={{whiteSpace: "nowrap"}}>
+            Booking type:
+          </label>
+          <select
+            id="booking-mode"
+            value={bookingMode}
+            onChange={(e) => setBookingMode(e.target.value as BookingMode)}
+            style={{padding: "0.25rem 0.4rem"}}
+          >
+            <option value="single">Single booking</option>
+            <option value="weekly">Weekly recurring</option>
+          </select>
+
+          {bookingMode === "weekly" && (
+            <>
+              <label htmlFor="booking-occurrences" style={{whiteSpace: "nowrap"}}>
+                Weeks:
+              </label>
+              <input
+                id="booking-occurrences"
+                type="number"
+                min={1}
+                step={1}
+                value={occurrences}
+                onChange={(e) => setOccurrences(e.target.value)}
+                style={{padding: "0.25rem 0.4rem", width: "5rem"}}
+              />
+            </>
+          )}
         </div>
 
         {isLoading && <p>Loading availability...</p>}

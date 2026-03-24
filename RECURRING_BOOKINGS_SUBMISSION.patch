@@ -1,0 +1,896 @@
+diff --git a/backend/build.gradle b/backend/build.gradle
+index cb3c4aa..4afe519 100644
+--- a/backend/build.gradle
++++ b/backend/build.gradle
+@@ -37,6 +37,7 @@ dependencies {
+     runtimeOnly("org.flywaydb:flyway-database-postgresql")
+     runtimeOnly("org.postgresql:postgresql")
+     runtimeOnly("org.yaml:snakeyaml")
++    testRuntimeOnly("com.h2database:h2")
+     testImplementation("io.micronaut:micronaut-http-client")
+ }
+ 
+@@ -44,8 +45,20 @@ dependencies {
+ application {
+     mainClass = "com.seatly.ApplicationKt"
+ }
++
++// Keep Java, Kotlin, and KSP on the same target so local JDK differences do
++// not cause backend builds to fail before tests even start.
++kotlin {
++    jvmToolchain(17)
++}
++
+ java {
+     sourceCompatibility = JavaVersion.toVersion("17")
++    targetCompatibility = JavaVersion.toVersion("17")
++}
++
++tasks.withType(org.jetbrains.kotlin.gradle.tasks.KotlinCompile).configureEach {
++    kotlinOptions.jvmTarget = "17"
+ }
+ 
+ 
+@@ -72,5 +85,3 @@ micronaut {
+     }
+ }
+ 
+-
+-
+diff --git a/backend/src/main/kotlin/com/seatly/desk/DeskController.kt b/backend/src/main/kotlin/com/seatly/desk/DeskController.kt
+index 0d2e610..177f5c7 100644
+--- a/backend/src/main/kotlin/com/seatly/desk/DeskController.kt
++++ b/backend/src/main/kotlin/com/seatly/desk/DeskController.kt
+@@ -4,6 +4,7 @@ import io.micronaut.http.HttpResponse
+ import io.micronaut.http.HttpStatus
+ import io.micronaut.http.annotation.Body
+ import io.micronaut.http.annotation.Controller
++import io.micronaut.http.annotation.Error
+ import io.micronaut.http.annotation.Get
+ import io.micronaut.http.annotation.PathVariable
+ import io.micronaut.http.annotation.Post
+@@ -13,6 +14,7 @@ import io.micronaut.security.authentication.Authentication
+ import io.micronaut.security.rules.SecurityRule
+ import io.micronaut.serde.annotation.Serdeable
+ import jakarta.validation.Valid
++import jakarta.validation.constraints.Min
+ import jakarta.validation.constraints.NotBlank
+ import jakarta.validation.constraints.NotNull
+ import java.time.LocalDateTime
+@@ -74,6 +76,12 @@ open class DeskController(
+     val responseBody = BookingResponse.from(created)
+     return HttpResponse.created(responseBody)
+   }
++
++  @Error(global = true)
++  fun handleBookingConflict(e: BookingConflictException): HttpResponse<Map<String, String>> =
++    HttpResponse
++      .status<Map<String, String>>(HttpStatus.CONFLICT)
++      .body(mapOf("message" to e.message.orEmpty()))
+ }
+ 
+ @Serdeable
+@@ -127,6 +135,11 @@ data class CreateBookingRequest(
+   val startAt: LocalDateTime,
+   @field:NotNull
+   val endAt: LocalDateTime,
++  // Optional so existing single-booking clients keep working unchanged.
++  val recurrenceType: BookingRecurrenceType? = null,
++  // Number of generated bookings in the recurring series when recurrence is used.
++  @field:Min(1)
++  val occurrences: Int? = null,
+ ) {
+   fun toCommand(
+     deskId: Long,
+@@ -137,6 +150,8 @@ data class CreateBookingRequest(
+       userId = userId,
+       startAt = startAt,
+       endAt = endAt,
++      recurrenceType = recurrenceType,
++      occurrences = occurrences,
+     )
+ }
+ 
+@@ -147,13 +162,36 @@ data class BookingResponse(
+   val userId: Long,
+   val startAt: LocalDateTime,
+   val endAt: LocalDateTime,
++  val recurrenceType: BookingRecurrenceType?,
++  val createdCount: Int,
++  val bookings: List<BookingOccurrenceResponse>,
+ ) {
+   companion object {
+-    fun from(booking: BookingDto): BookingResponse =
++    fun from(result: BookingCreationResultDto): BookingResponse =
+       BookingResponse(
++        id = result.primaryBooking.id,
++        deskId = result.primaryBooking.deskId,
++        userId = result.primaryBooking.userId,
++        startAt = result.primaryBooking.startAt,
++        endAt = result.primaryBooking.endAt,
++        recurrenceType = result.recurrenceType,
++        // Keeps single-booking clients simple while making recurring creation explicit.
++        createdCount = result.createdCount,
++        bookings = result.bookings.map { BookingOccurrenceResponse.from(it) },
++      )
++  }
++}
++
++@Serdeable
++data class BookingOccurrenceResponse(
++  val id: Long,
++  val startAt: LocalDateTime,
++  val endAt: LocalDateTime,
++) {
++  companion object {
++    fun from(booking: BookingDto): BookingOccurrenceResponse =
++      BookingOccurrenceResponse(
+         id = booking.id,
+-        deskId = booking.deskId,
+-        userId = booking.userId,
+         startAt = booking.startAt,
+         endAt = booking.endAt,
+       )
+diff --git a/backend/src/main/kotlin/com/seatly/desk/DeskManager.kt b/backend/src/main/kotlin/com/seatly/desk/DeskManager.kt
+index 24f8550..f328ece 100644
+--- a/backend/src/main/kotlin/com/seatly/desk/DeskManager.kt
++++ b/backend/src/main/kotlin/com/seatly/desk/DeskManager.kt
+@@ -1,11 +1,13 @@
+ package com.seatly.desk
+ 
++import io.micronaut.serde.annotation.Serdeable
+ import jakarta.inject.Singleton
++import jakarta.transaction.Transactional
+ import java.time.LocalDateTime
+ import java.time.temporal.ChronoUnit
+ 
+ @Singleton
+-class DeskManager(
++open class DeskManager(
+   private val deskRepository: DeskRepository,
+   private val bookingRepository: BookingRepository,
+ ) {
+@@ -77,28 +79,125 @@ class DeskManager(
+     return slots
+   }
+ 
+-  fun createBooking(command: CreateBookingCommand): BookingDto {
+-    require(command.startAt.isBefore(command.endAt)) {
+-      "startAt must be before endAt"
++  @Transactional
++  open fun createBooking(command: CreateBookingCommand): BookingCreationResultDto {
++    val generatedOccurrences = command.generateOccurrences()
++    validateGeneratedOccurrences(generatedOccurrences)
++    bookingRepository.validateNoConflictingOccurrences(
++      deskId = command.deskId,
++      occurrences = generatedOccurrences,
++    )
++
++    val savedBookings =
++      generatedOccurrences.map { occurrence ->
++        bookingRepository.save(
++          Booking(
++            deskId = command.deskId,
++            userId = command.userId,
++            startAt = occurrence.startAt,
++            endAt = occurrence.endAt,
++          ),
++        )
++      }
++
++    val savedBookingDtos = savedBookings.map { BookingDto.from(it) }
++
++    return BookingCreationResultDto(
++      primaryBooking = savedBookingDtos.first(),
++      createdCount = savedBookingDtos.size,
++      recurrenceType = command.recurrenceType,
++      bookings = savedBookingDtos,
++    )
++  }
++}
++
++private data class BookingOccurrence(
++  val startAt: LocalDateTime,
++  val endAt: LocalDateTime,
++)
++
++private fun CreateBookingCommand.generateOccurrences(): List<BookingOccurrence> {
++  validateRecurrenceRequest()
++
++  val normalizedStart = startAt.truncatedTo(ChronoUnit.MINUTES)
++  val normalizedEnd = endAt.truncatedTo(ChronoUnit.MINUTES)
++
++  return when (recurrenceType) {
++    null ->
++      listOf(
++        BookingOccurrence(
++          startAt = normalizedStart,
++          endAt = normalizedEnd,
++        ),
++      )
++    // Weekly recurrence is expanded server-side so later steps can validate and
++    // persist each generated booking consistently.
++    BookingRecurrenceType.WEEKLY -> {
++      val totalOccurrences = occurrences ?: 1
++
++      (0 until totalOccurrences).map { occurrenceIndex ->
++        BookingOccurrence(
++          startAt = normalizedStart.plusWeeks(occurrenceIndex.toLong()),
++          endAt = normalizedEnd.plusWeeks(occurrenceIndex.toLong()),
++        )
++      }
+     }
++  }
++}
+ 
+-    val normalizedStart = command.startAt.truncatedTo(ChronoUnit.MINUTES)
+-    val normalizedEnd = command.endAt.truncatedTo(ChronoUnit.MINUTES)
++private fun CreateBookingCommand.validateRecurrenceRequest() {
++  require(startAt.isBefore(endAt)) {
++    "startAt must be before endAt"
++  }
++
++  when (recurrenceType) {
++    null ->
++      require(occurrences == null) {
++        "occurrences can only be used with a recurrenceType"
++      }
++    // The enum already constrains supported recurrence values, so this branch
++    // only needs to enforce the rest of the recurring input contract.
++    BookingRecurrenceType.WEEKLY -> {
++      requireNotNull(occurrences) {
++        "occurrences is required for weekly recurring bookings"
++      }
+ 
+-    if (bookingRepository.existsOverlappingBooking(command.deskId, normalizedStart, normalizedEnd)) {
+-      throw IllegalStateException("Desk is already booked for the given time range")
++      require(occurrences >= 1) {
++        "occurrences must be at least 1"
++      }
+     }
++  }
++}
++
++private fun validateGeneratedOccurrences(occurrences: List<BookingOccurrence>) {
++  require(occurrences.isNotEmpty()) {
++    "Booking request must generate at least one occurrence"
++  }
++
++  // Re-check the expanded series so later steps can safely validate/save each
++  // generated booking without repeating this shape validation.
++  require(occurrences.all { it.startAt.isBefore(it.endAt) }) {
++    "Each booking occurrence must have startAt before endAt"
++  }
++}
+ 
+-    val booking =
+-      Booking(
+-        deskId = command.deskId,
+-        userId = command.userId,
+-        startAt = normalizedStart,
+-        endAt = normalizedEnd,
++private fun BookingRepository.validateNoConflictingOccurrences(
++  deskId: Long,
++  occurrences: List<BookingOccurrence>,
++) {
++  // Check the whole generated series up front so a recurring request cannot
++  // partially succeed once multi-row persistence is enabled.
++  val hasConflict =
++    occurrences.any { occurrence ->
++      existsOverlappingBooking(
++        deskId = deskId,
++        startAt = occurrence.startAt,
++        endAt = occurrence.endAt,
+       )
++    }
+ 
+-    val savedBooking = bookingRepository.save(booking)
+-    return BookingDto.from(savedBooking)
++  if (hasConflict) {
++    throw BookingConflictException()
+   }
+ }
+ 
+@@ -152,8 +251,20 @@ data class CreateBookingCommand(
+   val userId: Long,
+   val startAt: LocalDateTime,
+   val endAt: LocalDateTime,
++  // Null = "existing one-off booking flow".
++  val recurrenceType: BookingRecurrenceType? = null,
++  // One request into multiple weekly bookings.
++  val occurrences: Int? = null,
+ )
+ 
++@Serdeable
++enum class BookingRecurrenceType {
++  // Weekly recurrence only.
++  WEEKLY,
++}
++
++class BookingConflictException : RuntimeException("Desk is already booked for the given time range")
++
+ data class BookingDto(
+   val id: Long,
+   val deskId: Long,
+@@ -172,3 +283,12 @@ data class BookingDto(
+       )
+   }
+ }
++
++data class BookingCreationResultDto(
++  // Keeps the existing one-booking fields available in the API response.
++  val primaryBooking: BookingDto,
++  val createdCount: Int,
++  val recurrenceType: BookingRecurrenceType?,
++  // Includes every saved occurrence so recurring creates are explicit.
++  val bookings: List<BookingDto>,
++)
+diff --git a/backend/src/test/kotlin/com/seatly/desk/DeskControllerTest.kt b/backend/src/test/kotlin/com/seatly/desk/DeskControllerTest.kt
+index 1335e62..86b0a3f 100644
+--- a/backend/src/test/kotlin/com/seatly/desk/DeskControllerTest.kt
++++ b/backend/src/test/kotlin/com/seatly/desk/DeskControllerTest.kt
+@@ -237,6 +237,204 @@ class DeskControllerTest {
+     assertEquals(createBookingRequest.endAt.truncatedTo(ChronoUnit.MINUTES), booking.endAt)
+   }
+ 
++  @Test
++  fun `should create recurring weekly bookings successfully`() {
++    val desk: DeskResponse =
++      createDesk(
++        client = client,
++        authToken = authToken,
++        name = "Recurring Desk 1",
++        location = "Recurring Floor 1",
++      )
++    val deskId = desk.id!!
++
++    val recurringStart =
++      LocalDateTime
++        .now()
++        .plusDays(1)
++        .truncatedTo(ChronoUnit.HOURS)
++        .withHour(10)
++        .withMinute(0)
++    val recurringEnd = recurringStart.plusHours(1)
++    val createBookingRequest =
++      CreateBookingRequest(
++        startAt = recurringStart,
++        endAt = recurringEnd,
++        recurrenceType = BookingRecurrenceType.WEEKLY,
++        occurrences = 4,
++      )
++
++    val bookingResponse =
++      client.toBlocking().exchange(
++        HttpRequest
++          .POST("desks/$deskId/bookings", createBookingRequest)
++          .bearerAuth(authToken),
++        BookingResponse::class.java,
++      )
++
++    assertEquals(HttpStatus.CREATED, bookingResponse.status)
++    val booking = bookingResponse.body()
++    assertNotNull(booking)
++    assertEquals(BookingRecurrenceType.WEEKLY, booking!!.recurrenceType)
++    assertEquals(4, booking.createdCount)
++    assertEquals(4, booking.bookings.size)
++
++    // Verify the API summary and the DB both reflect the generated weekly series.
++    val savedBookings =
++      bookingRepository
++        .findAll()
++        .toList()
++        .filter { it.deskId == deskId }
++        .sortedBy { it.startAt }
++
++    assertEquals(4, savedBookings.size)
++
++    val expectedStarts =
++      (0 until 4).map { weekOffset ->
++        recurringStart.truncatedTo(ChronoUnit.MINUTES).plusWeeks(weekOffset.toLong())
++      }
++    val expectedEnds =
++      (0 until 4).map { weekOffset ->
++        recurringEnd.truncatedTo(ChronoUnit.MINUTES).plusWeeks(weekOffset.toLong())
++      }
++
++    assertEquals(expectedStarts, savedBookings.map { it.startAt })
++    assertEquals(expectedEnds, savedBookings.map { it.endAt })
++    assertEquals(expectedStarts, booking.bookings.map { it.startAt })
++    assertEquals(expectedEnds, booking.bookings.map { it.endAt })
++  }
++
++  @Test
++  fun `should reject recurring booking when one occurrence conflicts and save nothing from the series`() {
++    val desk: DeskResponse =
++      createDesk(
++        client = client,
++        authToken = authToken,
++        name = "Recurring Conflict Desk 1",
++        location = "Recurring Conflict Floor 1",
++      )
++    val deskId = desk.id!!
++
++    val recurringStart =
++      LocalDateTime
++        .now()
++        .plusDays(1)
++        .truncatedTo(ChronoUnit.HOURS)
++        .withHour(11)
++        .withMinute(0)
++    val recurringEnd = recurringStart.plusHours(1)
++
++    val existingBookingRequest =
++      CreateBookingRequest(
++        startAt = recurringStart.plusWeeks(2),
++        endAt = recurringEnd.plusWeeks(2),
++      )
++    val existingBookingResponse =
++      client.toBlocking().exchange(
++        HttpRequest
++          .POST("desks/$deskId/bookings", existingBookingRequest)
++          .bearerAuth(authToken),
++        BookingResponse::class.java,
++      )
++    assertEquals(HttpStatus.CREATED, existingBookingResponse.status)
++
++    val recurringBookingRequest =
++      CreateBookingRequest(
++        startAt = recurringStart,
++        endAt = recurringEnd,
++        recurrenceType = BookingRecurrenceType.WEEKLY,
++        occurrences = 4,
++      )
++
++    val exception =
++      assertThrows(HttpClientResponseException::class.java) {
++        client.toBlocking().exchange(
++          HttpRequest
++            .POST("desks/$deskId/bookings", recurringBookingRequest)
++            .bearerAuth(authToken),
++          BookingResponse::class.java,
++        )
++      }
++
++    assertEquals(HttpStatus.CONFLICT, exception.status)
++
++    // The pre-save conflict check should prevent any recurring rows from being inserted.
++    val savedBookings =
++      bookingRepository
++        .findAll()
++        .toList()
++        .filter { it.deskId == deskId }
++
++    assertEquals(1, savedBookings.size)
++    assertEquals(existingBookingRequest.startAt.truncatedTo(ChronoUnit.MINUTES), savedBookings[0].startAt)
++    assertEquals(existingBookingRequest.endAt.truncatedTo(ChronoUnit.MINUTES), savedBookings[0].endAt)
++  }
++
++  @Test
++  fun `should show recurring booking occurrences in availability`() {
++    val desk: DeskResponse =
++      createDesk(
++        client = client,
++        authToken = authToken,
++        name = "Recurring Availability Desk 1",
++        location = "Recurring Availability Floor 1",
++      )
++    val deskId = desk.id!!
++
++    val recurringStart =
++      LocalDateTime
++        .now()
++        .plusDays(1)
++        .truncatedTo(ChronoUnit.HOURS)
++        .withHour(9)
++        .withMinute(0)
++    val recurringEnd = recurringStart.plusMinutes(30)
++    val createBookingRequest =
++      CreateBookingRequest(
++        startAt = recurringStart,
++        endAt = recurringEnd,
++        recurrenceType = BookingRecurrenceType.WEEKLY,
++        occurrences = 3,
++      )
++
++    val bookingResponse =
++      client.toBlocking().exchange(
++        HttpRequest
++          .POST("desks/$deskId/bookings", createBookingRequest)
++          .bearerAuth(authToken),
++        BookingResponse::class.java,
++      )
++    assertEquals(HttpStatus.CREATED, bookingResponse.status)
++
++    val targetWeekStart = recurringStart.plusWeeks(1)
++    val targetWeekEnd = targetWeekStart.plusHours(2)
++    val path =
++      "/desks/$deskId/availability?startAt=$targetWeekStart&endAt=$targetWeekEnd"
++
++    val availabilityResponse =
++      client.toBlocking().exchange(
++        HttpRequest
++          .GET<Any>(path)
++          .bearerAuth(authToken),
++        Argument.listOf(AvailabilityResponse::class.java),
++      )
++
++    assertEquals(HttpStatus.OK, availabilityResponse.status)
++    val availability = availabilityResponse.body()
++    assertNotNull(availability)
++
++    // Recurring bookings reuse the normal availability path because each
++    // generated occurrence is stored as a regular booking row.
++    val bookedSlot =
++      availability!!.firstOrNull {
++        it.startAt == targetWeekStart.truncatedTo(ChronoUnit.MINUTES) &&
++          it.endAt == recurringEnd.plusWeeks(1).truncatedTo(ChronoUnit.MINUTES)
++      }
++
++    assertNotNull(bookedSlot)
++    assertEquals(AvailabilityStatus.BOOKED, bookedSlot!!.status)
++  }
++
+   @Test
+   fun `Should list available desk bookings within time range`() {
+     val desk: DeskResponse =
+diff --git a/frontend/src/features/desks/DeskDashboardPage.test.tsx b/frontend/src/features/desks/DeskDashboardPage.test.tsx
+index af6743c..c0633e0 100644
+--- a/frontend/src/features/desks/DeskDashboardPage.test.tsx
++++ b/frontend/src/features/desks/DeskDashboardPage.test.tsx
+@@ -2,8 +2,30 @@ import {beforeEach, describe, expect, it} from "vitest";
+ import {screen, waitFor, within} from "@testing-library/react";
+ import userEvent, {type UserEvent} from "@testing-library/user-event";
+ import {renderWithProviders} from "@/test-utils/renderWithProviders";
++import {server} from "@/test-utils/msw/server";
++import {http, HttpResponse} from "msw";
+ import DeskDashboardPage from "./DeskDashboardPage";
+ 
++async function openBookingModal(user: UserEvent) {
++  await screen.findByRole("heading", {name: /dashboard/i});
++  await screen.findByText("Desk A");
++
++  const bookButtons = screen.getAllByRole("button", {name: /^book$/i});
++  await user.click(bookButtons[0]);
++
++  const modalHeading = await screen.findByRole("heading", {
++    name: /book desk: desk a/i,
++  });
++  const modal = modalHeading.closest("div");
++  if (!modal) {
++    throw new Error("Booking modal container not found");
++  }
++
++  const modalUtils = within(modal);
++  await modalUtils.findByText(/showing availability 09:00 – 17:00/i);
++  return modalUtils;
++}
++
+ describe("DeskDashboardPage", () => {
+ 
+   let user: UserEvent;
+@@ -71,22 +93,7 @@ describe("DeskDashboardPage", () => {
+   });
+ 
+   it("allows booking a desk from the booking modal", async () => {
+-    await screen.findByRole("heading", {name: /dashboard/i});
+-    await screen.findByText("Desk A");
+-
+-    const bookButtons = screen.getAllByRole("button", {name: /^book$/i});
+-    await user.click(bookButtons[0]);
+-
+-    const modalHeading = await screen.findByRole("heading", {
+-      name: /book desk: desk a/i,
+-    });
+-    const modal = modalHeading.closest("div");
+-    if (!modal) {
+-      throw new Error("Booking modal container not found");
+-    }
+-    const modalUtils = within(modal);
+-
+-    await modalUtils.findByText(/showing availability 09:00 – 17:00/i);
++    const modalUtils = await openBookingModal(user);
+ 
+     const slotBookButtons = await modalUtils.findAllByRole("button", {
+       name: /^book$/i,
+@@ -100,4 +107,94 @@ describe("DeskDashboardPage", () => {
+       ).not.toBeInTheDocument();
+     });
+   });
+-});
+\ No newline at end of file
++
++  it("shows recurring controls and sends weekly booking payload", async () => {
++    let capturedBookingBody: Record<string, unknown> | null = null;
++
++    server.use(
++      http.post("*/desks/:deskId/bookings", async ({params, request}) => {
++        const deskId = Number(params.deskId);
++        capturedBookingBody = (await request.json()) as Record<string, unknown>;
++
++        return HttpResponse.json(
++          {
++            id: 101,
++            deskId,
++            userId: 1,
++            startAt: capturedBookingBody.startAt,
++            endAt: capturedBookingBody.endAt,
++            recurrenceType: capturedBookingBody.recurrenceType ?? null,
++            createdCount: capturedBookingBody.occurrences ?? 1,
++            bookings: [
++              {
++                id: 101,
++                startAt: capturedBookingBody.startAt,
++                endAt: capturedBookingBody.endAt,
++              },
++            ],
++          },
++          {status: 201},
++        );
++      }),
++    );
++
++    const modalUtils = await openBookingModal(user);
++
++    await user.selectOptions(
++      modalUtils.getByLabelText(/booking type/i),
++      "weekly",
++    );
++
++    const weeksInput = modalUtils.getByLabelText(/weeks/i);
++    expect(weeksInput).toBeInTheDocument();
++    await user.clear(weeksInput);
++    await user.type(weeksInput, "6");
++
++    const slotBookButtons = await modalUtils.findAllByRole("button", {
++      name: /^book$/i,
++    });
++    await user.click(slotBookButtons[0]);
++
++    await waitFor(() => {
++      expect(capturedBookingBody).not.toBeNull();
++    });
++
++    expect(capturedBookingBody).toMatchObject({
++      recurrenceType: "WEEKLY",
++      occurrences: 6,
++    });
++  });
++
++  it("shows backend booking conflict errors in the booking modal", async () => {
++    server.use(
++      http.post("*/desks/:deskId/bookings", () =>
++        HttpResponse.json(
++          {message: "Desk is already booked for the given time range"},
++          {status: 409},
++        ),
++      ),
++    );
++
++    const modalUtils = await openBookingModal(user);
++
++    await user.selectOptions(
++      modalUtils.getByLabelText(/booking type/i),
++      "weekly",
++    );
++
++    const slotBookButtons = await modalUtils.findAllByRole("button", {
++      name: /^book$/i,
++    });
++    await user.click(slotBookButtons[0]);
++
++    expect(
++      await modalUtils.findByText(
++        /could not create booking: desk is already booked for the given time range/i,
++      ),
++    ).toBeInTheDocument();
++
++    expect(
++      screen.getByRole("heading", {name: /book desk: desk a/i}),
++    ).toBeInTheDocument();
++  });
++});
+diff --git a/frontend/src/features/desks/api/deskBookings.ts b/frontend/src/features/desks/api/deskBookings.ts
+index 7155fa2..a6e9074 100644
+--- a/frontend/src/features/desks/api/deskBookings.ts
++++ b/frontend/src/features/desks/api/deskBookings.ts
+@@ -15,6 +15,8 @@ export type CreateBookingInput = {
+   deskId: number;
+   startAt: string;
+   endAt: string;
++  recurrenceType?: "WEEKLY";
++  occurrences?: number;
+ };
+ 
+ type ApiError = {
+@@ -95,7 +97,7 @@ async function createBooking(
+     throw new Error("Not authenticated");
+   }
+ 
+-  const {deskId, startAt, endAt} = input;
++  const {deskId, startAt, endAt, recurrenceType, occurrences} = input;
+ 
+   const response = await fetch(`${API_BASE_URL}/desks/${deskId}/bookings`, {
+     method: "POST",
+@@ -103,7 +105,12 @@ async function createBooking(
+       "Content-Type": "application/json",
+       Authorization: `Bearer ${accessToken}`,
+     },
+-    body: JSON.stringify({startAt, endAt}),
++    // Recurrence fields are only sent when the user chooses weekly booking.
++    body: JSON.stringify({
++      startAt,
++      endAt,
++      ...(recurrenceType ? {recurrenceType, occurrences} : {}),
++    }),
+   });
+ 
+   if (!response.ok) {
+@@ -132,4 +139,4 @@ export function useCreateBookingMutation() {
+   return useMutation({
+     mutationFn: (input: CreateBookingInput) => createBooking(accessToken, input),
+   });
+-}
+\ No newline at end of file
++}
+diff --git a/frontend/src/features/desks/components/DeskBookingModal.tsx b/frontend/src/features/desks/components/DeskBookingModal.tsx
+index 3bbeb48..953657c 100644
+--- a/frontend/src/features/desks/components/DeskBookingModal.tsx
++++ b/frontend/src/features/desks/components/DeskBookingModal.tsx
+@@ -13,6 +13,8 @@ type DeskBookingModalProps = {
+   onClose: () => void;
+ };
+ 
++type BookingMode = "single" | "weekly";
++
+ function toLocalDateTimeString(date: Date): string {
+   const pad = (n: number) => n.toString().padStart(2, "0");
+ 
+@@ -55,6 +57,8 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+                                                                   }) => {
+   const queryClient = useQueryClient();
+   const [selectedDate, setSelectedDate] = React.useState<Date>(() => new Date());
++  const [bookingMode, setBookingMode] = React.useState<BookingMode>("single");
++  const [occurrences, setOccurrences] = React.useState("4");
+ 
+   const start = React.useMemo(
+     () =>
+@@ -109,11 +113,27 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+ 
+   const handleBookSlot = async (slot: AvailabilitySlot) => {
+     setBookingError(null);
++
++    const trimmedOccurrences = occurrences.trim();
++    const parsedOccurrences = Number.parseInt(trimmedOccurrences, 10);
++    if (bookingMode === "weekly" && (!Number.isInteger(parsedOccurrences) || parsedOccurrences < 1)) {
++      setBookingError("Weekly recurring bookings require at least 1 occurrence.");
++      return;
++    }
++
+     try {
+       await bookingMutation.mutateAsync({
+         deskId: desk.id,
+         startAt: slot.startAt,
+         endAt: slot.endAt,
++        ...(bookingMode === "weekly"
++          ? {
++              // The modal keeps the current slot selection and only adds the
++              // extra weekly recurrence details when requested by the user.
++              recurrenceType: "WEEKLY" as const,
++              occurrences: parsedOccurrences,
++            }
++          : {}),
+       });
+ 
+       // Refresh availability after successful booking
+@@ -124,6 +144,7 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+       onClose();
+     } catch (err) {
+       const message = err instanceof Error ? err.message : "Unknown error";
++      // Backend conflict responses surface here so the user sees the exact reason.
+       setBookingError(`Could not create booking: ${message}`);
+     }
+   };
+@@ -142,6 +163,8 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+   React.useEffect(() => {
+     if (isOpen) {
+       setSelectedDate(new Date());
++      setBookingMode("single");
++      setOccurrences("4");
+       setBookingError(null);
+     }
+   }, [isOpen]);
+@@ -200,6 +223,47 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+           </span>
+         </div>
+ 
++        <div
++          style={{
++            display: "flex",
++            alignItems: "center",
++            gap: "0.75rem",
++            marginBottom: "0.75rem",
++            fontSize: "0.9rem",
++            flexWrap: "wrap",
++          }}
++        >
++          <label htmlFor="booking-mode" style={{whiteSpace: "nowrap"}}>
++            Booking type:
++          </label>
++          <select
++            id="booking-mode"
++            value={bookingMode}
++            onChange={(e) => setBookingMode(e.target.value as BookingMode)}
++            style={{padding: "0.25rem 0.4rem"}}
++          >
++            <option value="single">Single booking</option>
++            <option value="weekly">Weekly recurring</option>
++          </select>
++
++          {bookingMode === "weekly" && (
++            <>
++              <label htmlFor="booking-occurrences" style={{whiteSpace: "nowrap"}}>
++                Weeks:
++              </label>
++              <input
++                id="booking-occurrences"
++                type="number"
++                min={1}
++                step={1}
++                value={occurrences}
++                onChange={(e) => setOccurrences(e.target.value)}
++                style={{padding: "0.25rem 0.4rem", width: "5rem"}}
++              />
++            </>
++          )}
++        </div>
++
+         {isLoading && <p>Loading availability...</p>}
+ 
+         {isError && (
+@@ -337,4 +401,4 @@ export const DeskBookingModal: React.FC<DeskBookingModalProps> = ({
+       </div>
+     </div>
+   );
+-};
+\ No newline at end of file
++};
+diff --git a/frontend/src/setupTests.ts b/frontend/src/setupTests.ts
+index 1dbf4b8..116680c 100644
+--- a/frontend/src/setupTests.ts
++++ b/frontend/src/setupTests.ts
+@@ -2,8 +2,31 @@ import '@testing-library/jest-dom';
+ import {afterAll, afterEach, beforeAll} from 'vitest';
+ import {server} from './test-utils/msw/server';
+ 
++const storage = new Map<string, string>();
++
++// Some local test environments do not provide a writable Storage object, but
++// the auth provider relies on localStorage for bootstrapping auth state.
++Object.defineProperty(window, 'localStorage', {
++  configurable: true,
++  value: {
++    getItem: (key: string) => storage.get(key) ?? null,
++    setItem: (key: string, value: string) => {
++      storage.set(key, value);
++    },
++    removeItem: (key: string) => {
++      storage.delete(key);
++    },
++    clear: () => {
++      storage.clear();
++    },
++  },
++});
++
+ beforeAll(() => server.listen({onUnhandledRequest: 'error'}));
+ 
+-afterEach(() => server.resetHandlers());
++afterEach(() => {
++  server.resetHandlers();
++  window.localStorage.clear();
++});
+ 
+-afterAll(() => server.close());
+\ No newline at end of file
++afterAll(() => server.close());
